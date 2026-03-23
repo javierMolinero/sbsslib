@@ -1,0 +1,37 @@
+# Build artifacts
+build/
+build-*/
+out/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+CTestTestfile.cmake
+Testing/
+
+# VS Code
+.vscode/
+
+# Binary outputs
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.pdb
+
+# Logs
+*.log
+
+# Local third-party dependency builds
+third_party/zlib_src/
+third_party/zlib_build/
+third_party/zlib_install/
+third_party/cfitsio_src/
+third_party/cfitsio_build/
+third_party/cfitsio_install/

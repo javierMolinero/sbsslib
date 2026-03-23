@@ -17,7 +17,7 @@ It includes:
   - `DETECT_MINAREA`
   - `FILTER_SIZE`
   - `MAX_SOURCES`
-- CSV catalog output.
+- SExtractor-like text output catalog with `.sbss` extension.
 
 ## Fixed capacities (MISRA-oriented)
 
@@ -66,7 +66,13 @@ cmake -S . -B build
 ## CLI usage
 
 ```bash
-sbssx image.fits -c config/sbsslib.conf -CATALOG_NAME catalog.csv
+sbssx image.fits -c config/sbsslib.conf
+```
+
+By default, output is written as `image.fits.sbss`.
+
+```bash
+sbssx image.fits -c config/sbsslib.conf -CATALOG_NAME catalog.sbss
 ```
 
 Override selected config keys from CLI:
@@ -77,13 +83,14 @@ sbssx image.fits -c config/sbsslib.conf -DETECT_THRESH 4.0 -DETECT_MINAREA 7
 
 ## Output catalog
 
-CSV columns:
-- `id`
-- `x`
-- `y`
-- `peak`
-- `flux`
-- `area`
+Current output columns (matching `centu2.param` up to `FLUX_AUTO`):
+- `X_IMAGE`
+- `Y_IMAGE`
+- `XMIN_IMAGE`
+- `XMAX_IMAGE`
+- `YMIN_IMAGE`
+- `YMAX_IMAGE`
+- `FLUX_AUTO`
 
 ## Repository setup for remote
 

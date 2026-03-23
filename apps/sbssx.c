@@ -6,10 +6,18 @@
 
 static sbss_detection g_detections[SBSS_MAX_DETECTIONS];
 
+static void make_default_catalog_path(const char* fits_path, char* out_path, size_t out_size) {
+    if (fits_path == NULL || out_path == NULL || out_size == 0U) {
+        return;
+    }
+
+    (void)snprintf(out_path, out_size, "%s.sbss", fits_path);
+}
+
 static void print_usage(void) {
     printf("sbssx - lightweight source extractor focused on point detection\n");
     printf("Usage:\n");
-    printf("  sbssx <image.fits> [-c <config.conf>] [-CATALOG_NAME <catalog.csv>]\n");
+    printf("  sbssx <image.fits> [-c <config.conf>] [-CATALOG_NAME <catalog.sbss>]\n");
     printf("                     [-DETECT_THRESH <sigma>] [-DETECT_MINAREA <n>]\n");
 }
 
@@ -36,7 +44,8 @@ static int parse_double(const char* text, double* out) {
 int main(int argc, char** argv) {
     const char* fits_path = NULL;
     const char* config_path = NULL;
-    const char* catalog_path = "sbsslib_catalog.csv";
+    const char* catalog_path = NULL;
+    char default_catalog_path[1024] = {0};
     sbss_config cfg;
     size_t detection_count = 0;
     char error_message[512] = {0};
@@ -50,6 +59,8 @@ int main(int argc, char** argv) {
     sbss_config_set_defaults(&cfg);
 
     fits_path = argv[1];
+    make_default_catalog_path(fits_path, default_catalog_path, sizeof(default_catalog_path));
+    catalog_path = default_catalog_path;
 
     for (i = 2; i < argc; ++i) {
         if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
@@ -96,7 +107,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (sbss_write_catalog_csv(
+    if (sbss_write_catalog_sbss(
             catalog_path,
             g_detections,
             detection_count,

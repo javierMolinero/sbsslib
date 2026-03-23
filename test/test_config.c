@@ -22,5 +22,15 @@ int main(void) {
         return 1;
     }
 
+    if (cfg.back_size < 8) {
+        fprintf(stderr, "default BACK_SIZE should be >= 8\n");
+        return 1;
+    }
+
+    if (cfg.back_filtersize < 1 || cfg.back_filtersize % 2 == 0) {
+        fprintf(stderr, "default BACK_FILTERSIZE should be odd and >= 1\n");
+        return 1;
+    }
+
     return 0;
 }

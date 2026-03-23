@@ -10,6 +10,10 @@ extern "C" {
 typedef struct sbss_detection {
     double x;
     double y;
+    int xmin;
+    int xmax;
+    int ymin;
+    int ymax;
     double peak;
     double flux;
     int area;
@@ -19,6 +23,8 @@ typedef struct sbss_config {
     double detect_thresh_sigma;
     int detect_minarea;
     int filter_size;
+    int back_size;
+    int back_filtersize;
     int max_sources;
 } sbss_config;
 
@@ -49,7 +55,7 @@ int sbss_detect_from_fits(
     size_t error_message_size
 );
 
-int sbss_write_catalog_csv(
+int sbss_write_catalog_sbss(
     const char* output_path,
     const sbss_detection* detections,
     size_t detection_count,

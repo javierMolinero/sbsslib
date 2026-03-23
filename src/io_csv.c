@@ -2,7 +2,7 @@
 
 #include "internal.h"
 
-int sbss_write_catalog_csv(
+int sbss_write_catalog_sbss(
     const char* output_path,
     const sbss_detection* detections,
     size_t detection_count,
@@ -11,6 +11,8 @@ int sbss_write_catalog_csv(
 ) {
     FILE* out;
     size_t i;
+    double x_image;
+    double y_image;
 
     if (output_path == NULL || detections == NULL) {
         sbss_set_error(error_message, error_message_size, "invalid catalog output input");
@@ -23,17 +25,21 @@ int sbss_write_catalog_csv(
         return -1;
     }
 
-    fprintf(out, "id,x,y,peak,flux,area\n");
     for (i = 0; i < detection_count; ++i) {
+        /* SExtractor-like pixel coordinates are 1-based. */
+        x_image = detections[i].x + 1.0;
+        y_image = detections[i].y + 1.0;
+
         fprintf(
             out,
-            "%zu,%.6f,%.6f,%.6f,%.6f,%d\n",
-            i + 1,
-            detections[i].x,
-            detections[i].y,
-            detections[i].peak,
-            detections[i].flux,
-            detections[i].area
+            "%10.3f %10.3f %10d %10d %10d %10d %12.6g\n",
+            x_image,
+            y_image,
+            detections[i].xmin + 1,
+            detections[i].xmax + 1,
+            detections[i].ymin + 1,
+            detections[i].ymax + 1,
+            detections[i].flux
         );
     }
 

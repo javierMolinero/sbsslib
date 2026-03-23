@@ -4,6 +4,10 @@
 
 #include "internal.h"
 
+#define SBSS_MIN_BACK_SIZE 8
+#define SBSS_MAX_MESH_PER_AXIS ((4096 / SBSS_MIN_BACK_SIZE) + 2)
+#define SBSS_MAX_MESH_COUNT (SBSS_MAX_MESH_PER_AXIS * SBSS_MAX_MESH_PER_AXIS)
+
 static int compare_detection_peak_desc(const void* a, const void* b) {
     const sbss_detection* da = (const sbss_detection*)a;
     const sbss_detection* db = (const sbss_detection*)b;
@@ -35,6 +39,163 @@ static void compute_stats(const double* pixels, long count, double* mean, double
         }
         *sigma = sqrt(variance);
     }
+}
+
+static int clamp_int(int value, int min_value, int max_value) {
+    if (value < min_value) {
+        return min_value;
+    }
+    if (value > max_value) {
+        return max_value;
+    }
+    return value;
+}
+
+static int apply_background_subtraction(
+    double* pixels,
+    long width,
+    long height,
+    int back_size,
+    int back_filtersize,
+    char* error_message,
+    size_t error_message_size
+) {
+    static double mesh_bg[SBSS_MAX_MESH_COUNT];
+    static double mesh_bg_filtered[SBSS_MAX_MESH_COUNT];
+    int nx;
+    int ny;
+    int mesh_count;
+    int mx;
+    int my;
+    long x;
+    long y;
+
+    if (back_size < SBSS_MIN_BACK_SIZE) {
+        sbss_set_error(error_message, error_message_size, "BACK_SIZE must be >= %d", SBSS_MIN_BACK_SIZE);
+        return -1;
+    }
+
+    if (back_filtersize < 1) {
+        back_filtersize = 1;
+    }
+    if ((back_filtersize % 2) == 0) {
+        back_filtersize += 1;
+    }
+
+    nx = (int)((width + back_size - 1) / back_size);
+    ny = (int)((height + back_size - 1) / back_size);
+    mesh_count = nx * ny;
+
+    if (mesh_count <= 0 || mesh_count > SBSS_MAX_MESH_COUNT) {
+        sbss_set_error(error_message, error_message_size, "invalid background mesh geometry");
+        return -1;
+    }
+
+    for (my = 0; my < ny; ++my) {
+        for (mx = 0; mx < nx; ++mx) {
+            long x0 = (long)mx * (long)back_size;
+            long y0 = (long)my * (long)back_size;
+            long x1 = x0 + (long)back_size;
+            long y1 = y0 + (long)back_size;
+            double sum = 0.0;
+            long count = 0;
+
+            if (x1 > width) {
+                x1 = width;
+            }
+            if (y1 > height) {
+                y1 = height;
+            }
+
+            for (y = y0; y < y1; ++y) {
+                for (x = x0; x < x1; ++x) {
+                    sum += pixels[y * width + x];
+                    count++;
+                }
+            }
+
+            if (count > 0) {
+                mesh_bg[my * nx + mx] = sum / (double)count;
+            } else {
+                mesh_bg[my * nx + mx] = 0.0;
+            }
+        }
+    }
+
+    {
+        int fr = back_filtersize / 2;
+        for (my = 0; my < ny; ++my) {
+            for (mx = 0; mx < nx; ++mx) {
+                int yy;
+                int xx;
+                double sum = 0.0;
+                int count = 0;
+
+                for (yy = my - fr; yy <= my + fr; ++yy) {
+                    for (xx = mx - fr; xx <= mx + fr; ++xx) {
+                        int cy = clamp_int(yy, 0, ny - 1);
+                        int cx = clamp_int(xx, 0, nx - 1);
+                        sum += mesh_bg[cy * nx + cx];
+                        count++;
+                    }
+                }
+
+                mesh_bg_filtered[my * nx + mx] = (count > 0) ? (sum / (double)count) : mesh_bg[my * nx + mx];
+            }
+        }
+    }
+
+    for (y = 0; y < height; ++y) {
+        for (x = 0; x < width; ++x) {
+            double gx = (((double)x) + 0.5) / (double)back_size - 0.5;
+            double gy = (((double)y) + 0.5) / (double)back_size - 0.5;
+            int ix0 = (int)floor(gx);
+            int iy0 = (int)floor(gy);
+            int ix1;
+            int iy1;
+            double fx;
+            double fy;
+            double b00;
+            double b10;
+            double b01;
+            double b11;
+            double bg;
+
+            ix0 = clamp_int(ix0, 0, nx - 1);
+            iy0 = clamp_int(iy0, 0, ny - 1);
+            ix1 = clamp_int(ix0 + 1, 0, nx - 1);
+            iy1 = clamp_int(iy0 + 1, 0, ny - 1);
+
+            fx = gx - (double)ix0;
+            fy = gy - (double)iy0;
+            if (fx < 0.0) {
+                fx = 0.0;
+            }
+            if (fx > 1.0) {
+                fx = 1.0;
+            }
+            if (fy < 0.0) {
+                fy = 0.0;
+            }
+            if (fy > 1.0) {
+                fy = 1.0;
+            }
+
+            b00 = mesh_bg_filtered[iy0 * nx + ix0];
+            b10 = mesh_bg_filtered[iy0 * nx + ix1];
+            b01 = mesh_bg_filtered[iy1 * nx + ix0];
+            b11 = mesh_bg_filtered[iy1 * nx + ix1];
+
+            bg = (1.0 - fx) * (1.0 - fy) * b00
+                + fx * (1.0 - fy) * b10
+                + (1.0 - fx) * fy * b01
+                + fx * fy * b11;
+
+            pixels[y * width + x] -= bg;
+        }
+    }
+
+    return 0;
 }
 
 static int is_local_maximum(
@@ -184,6 +345,16 @@ int sbss_detect_from_fits(
         return -1;
     }
 
+    if (local_cfg.back_size < SBSS_MIN_BACK_SIZE) {
+        sbss_set_error(error_message, error_message_size, "BACK_SIZE must be >= %d", SBSS_MIN_BACK_SIZE);
+        return -1;
+    }
+
+    if (local_cfg.back_filtersize < 1) {
+        sbss_set_error(error_message, error_message_size, "BACK_FILTERSIZE must be >= 1");
+        return -1;
+    }
+
     if (local_cfg.detect_minarea < 1) {
         sbss_set_error(error_message, error_message_size, "DETECT_MINAREA must be >= 1");
         return -1;
@@ -222,6 +393,18 @@ int sbss_detect_from_fits(
     n_pix = width * height;
     if (n_pix <= 0) {
         sbss_set_error(error_message, error_message_size, "empty FITS image");
+        return -1;
+    }
+
+    if (apply_background_subtraction(
+            pixel_workspace,
+            width,
+            height,
+            local_cfg.back_size,
+            local_cfg.back_filtersize,
+            error_message,
+            error_message_size
+        ) != 0) {
         return -1;
     }
 
@@ -266,6 +449,10 @@ int sbss_detect_from_fits(
 
             detections[out_count].x = cx;
             detections[out_count].y = cy;
+            detections[out_count].xmin = (int)((x - radius) < 0 ? 0 : (x - radius));
+            detections[out_count].xmax = (int)((x + radius) >= width ? (width - 1) : (x + radius));
+            detections[out_count].ymin = (int)((y - radius) < 0 ? 0 : (y - radius));
+            detections[out_count].ymax = (int)((y + radius) >= height ? (height - 1) : (y + radius));
             detections[out_count].peak = peak;
             detections[out_count].flux = flux;
             detections[out_count].area = area;

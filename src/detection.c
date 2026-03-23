@@ -5,8 +5,18 @@
 #include "internal.h"
 
 #define SBSS_MIN_BACK_SIZE 8
-#define SBSS_MAX_MESH_PER_AXIS ((4096 / SBSS_MIN_BACK_SIZE) + 2)
-#define SBSS_MAX_MESH_COUNT (SBSS_MAX_MESH_PER_AXIS * SBSS_MAX_MESH_PER_AXIS)
+#define SBSS_MAX_MESH_X 1024
+#define SBSS_MAX_MESH_Y 1024
+#define SBSS_MAX_MESH_COUNT (SBSS_MAX_MESH_X * SBSS_MAX_MESH_Y)
+
+static double g_pixels[SBSS_MAX_IMAGE_PIXELS];
+static double g_detect_pixels[SBSS_MAX_IMAGE_PIXELS];
+static unsigned char g_visited[SBSS_MAX_IMAGE_PIXELS];
+static int g_component_pixels[SBSS_MAX_IMAGE_PIXELS];
+static double g_mesh_bg[SBSS_MAX_MESH_COUNT];
+static double g_mesh_rms[SBSS_MAX_MESH_COUNT];
+static double g_mesh_bg_smooth[SBSS_MAX_MESH_COUNT];
+static double g_mesh_rms_smooth[SBSS_MAX_MESH_COUNT];
 
 static int compare_detection_peak_desc(const void* a, const void* b) {
     const sbss_detection* da = (const sbss_detection*)a;
@@ -21,26 +31,6 @@ static int compare_detection_peak_desc(const void* a, const void* b) {
     return 0;
 }
 
-static void compute_stats(const double* pixels, long count, double* mean, double* sigma) {
-    long i;
-    double sum = 0.0;
-    double sum_sq = 0.0;
-
-    for (i = 0; i < count; ++i) {
-        sum += pixels[i];
-        sum_sq += pixels[i] * pixels[i];
-    }
-
-    *mean = sum / (double)count;
-    {
-        double variance = (sum_sq / (double)count) - ((*mean) * (*mean));
-        if (variance < 1e-20) {
-            variance = 1e-20;
-        }
-        *sigma = sqrt(variance);
-    }
-}
-
 static int clamp_int(int value, int min_value, int max_value) {
     if (value < min_value) {
         return min_value;
@@ -51,20 +41,112 @@ static int clamp_int(int value, int min_value, int max_value) {
     return value;
 }
 
-static int apply_background_subtraction(
+static void robust_mean_rms(const double* values, int n, double* out_mean, double* out_rms) {
+    int i;
+    int iter;
+    double mean = 0.0;
+    double rms;
+
+    for (i = 0; i < n; ++i) {
+        mean += values[i];
+    }
+    mean /= (double)n;
+
+    rms = 0.0;
+    for (i = 0; i < n; ++i) {
+        double d = values[i] - mean;
+        rms += d * d;
+    }
+    rms = sqrt(rms / (double)n);
+
+    for (iter = 0; iter < 3; ++iter) {
+        double s = 0.0;
+        double s2 = 0.0;
+        int used = 0;
+        double low = mean - 3.0 * rms;
+        double high = mean + 3.0 * rms;
+
+        for (i = 0; i < n; ++i) {
+            if (values[i] >= low && values[i] <= high) {
+                s += values[i];
+                s2 += values[i] * values[i];
+                used++;
+            }
+        }
+
+        if (used < 8) {
+            break;
+        }
+
+        mean = s / (double)used;
+        rms = s2 / (double)used - mean * mean;
+        if (rms < 1e-20) {
+            rms = 1e-20;
+        }
+        rms = sqrt(rms);
+    }
+
+    *out_mean = mean;
+    *out_rms = rms;
+}
+
+static void interpolate_mesh_value(
+    const double* mesh,
+    int nx,
+    int ny,
+    int back_size,
+    long x,
+    long y,
+    double* out_value
+) {
+    double gx = (((double)x) + 0.5) / (double)back_size - 0.5;
+    double gy = (((double)y) + 0.5) / (double)back_size - 0.5;
+    int ix0 = (int)floor(gx);
+    int iy0 = (int)floor(gy);
+    int ix1;
+    int iy1;
+    double fx;
+    double fy;
+
+    ix0 = clamp_int(ix0, 0, nx - 1);
+    iy0 = clamp_int(iy0, 0, ny - 1);
+    ix1 = clamp_int(ix0 + 1, 0, nx - 1);
+    iy1 = clamp_int(iy0 + 1, 0, ny - 1);
+
+    fx = gx - (double)ix0;
+    fy = gy - (double)iy0;
+    if (fx < 0.0) {
+        fx = 0.0;
+    }
+    if (fx > 1.0) {
+        fx = 1.0;
+    }
+    if (fy < 0.0) {
+        fy = 0.0;
+    }
+    if (fy > 1.0) {
+        fy = 1.0;
+    }
+
+    *out_value = (1.0 - fx) * (1.0 - fy) * mesh[iy0 * nx + ix0]
+        + fx * (1.0 - fy) * mesh[iy0 * nx + ix1]
+        + (1.0 - fx) * fy * mesh[iy1 * nx + ix0]
+        + fx * fy * mesh[iy1 * nx + ix1];
+}
+
+static int build_background_model(
     double* pixels,
     long width,
     long height,
     int back_size,
     int back_filtersize,
+    int* out_nx,
+    int* out_ny,
     char* error_message,
     size_t error_message_size
 ) {
-    static double mesh_bg[SBSS_MAX_MESH_COUNT];
-    static double mesh_bg_filtered[SBSS_MAX_MESH_COUNT];
     int nx;
     int ny;
-    int mesh_count;
     int mx;
     int my;
     long x;
@@ -84,10 +166,8 @@ static int apply_background_subtraction(
 
     nx = (int)((width + back_size - 1) / back_size);
     ny = (int)((height + back_size - 1) / back_size);
-    mesh_count = nx * ny;
-
-    if (mesh_count <= 0 || mesh_count > SBSS_MAX_MESH_COUNT) {
-        sbss_set_error(error_message, error_message_size, "invalid background mesh geometry");
+    if (nx < 1 || ny < 1 || nx > SBSS_MAX_MESH_X || ny > SBSS_MAX_MESH_Y) {
+        sbss_set_error(error_message, error_message_size, "invalid mesh dimensions (%d x %d)", nx, ny);
         return -1;
     }
 
@@ -97,8 +177,10 @@ static int apply_background_subtraction(
             long y0 = (long)my * (long)back_size;
             long x1 = x0 + (long)back_size;
             long y1 = y0 + (long)back_size;
-            double sum = 0.0;
-            long count = 0;
+            double mean;
+            double rms;
+            int c = 0;
+            static double cell_values[128 * 128];
 
             if (x1 > width) {
                 x1 = width;
@@ -109,16 +191,21 @@ static int apply_background_subtraction(
 
             for (y = y0; y < y1; ++y) {
                 for (x = x0; x < x1; ++x) {
-                    sum += pixels[y * width + x];
-                    count++;
+                    if (c < (int)(sizeof(cell_values) / sizeof(cell_values[0]))) {
+                        cell_values[c++] = pixels[y * width + x];
+                    }
                 }
             }
 
-            if (count > 0) {
-                mesh_bg[my * nx + mx] = sum / (double)count;
+            if (c < 8) {
+                mean = 0.0;
+                rms = 1.0;
             } else {
-                mesh_bg[my * nx + mx] = 0.0;
+                robust_mean_rms(cell_values, c, &mean, &rms);
             }
+
+            g_mesh_bg[my * nx + mx] = mean;
+            g_mesh_rms[my * nx + mx] = (rms > 1e-6) ? rms : 1e-6;
         }
     }
 
@@ -128,183 +215,151 @@ static int apply_background_subtraction(
             for (mx = 0; mx < nx; ++mx) {
                 int yy;
                 int xx;
-                double sum = 0.0;
-                int count = 0;
+                double s_bg = 0.0;
+                double s_rms = 0.0;
+                int cnt = 0;
 
                 for (yy = my - fr; yy <= my + fr; ++yy) {
                     for (xx = mx - fr; xx <= mx + fr; ++xx) {
                         int cy = clamp_int(yy, 0, ny - 1);
                         int cx = clamp_int(xx, 0, nx - 1);
-                        sum += mesh_bg[cy * nx + cx];
-                        count++;
+                        s_bg += g_mesh_bg[cy * nx + cx];
+                        s_rms += g_mesh_rms[cy * nx + cx];
+                        cnt++;
                     }
                 }
 
-                mesh_bg_filtered[my * nx + mx] = (count > 0) ? (sum / (double)count) : mesh_bg[my * nx + mx];
+                g_mesh_bg_smooth[my * nx + mx] = s_bg / (double)cnt;
+                g_mesh_rms_smooth[my * nx + mx] = s_rms / (double)cnt;
             }
         }
     }
 
     for (y = 0; y < height; ++y) {
         for (x = 0; x < width; ++x) {
-            double gx = (((double)x) + 0.5) / (double)back_size - 0.5;
-            double gy = (((double)y) + 0.5) / (double)back_size - 0.5;
-            int ix0 = (int)floor(gx);
-            int iy0 = (int)floor(gy);
-            int ix1;
-            int iy1;
-            double fx;
-            double fy;
-            double b00;
-            double b10;
-            double b01;
-            double b11;
             double bg;
-
-            ix0 = clamp_int(ix0, 0, nx - 1);
-            iy0 = clamp_int(iy0, 0, ny - 1);
-            ix1 = clamp_int(ix0 + 1, 0, nx - 1);
-            iy1 = clamp_int(iy0 + 1, 0, ny - 1);
-
-            fx = gx - (double)ix0;
-            fy = gy - (double)iy0;
-            if (fx < 0.0) {
-                fx = 0.0;
-            }
-            if (fx > 1.0) {
-                fx = 1.0;
-            }
-            if (fy < 0.0) {
-                fy = 0.0;
-            }
-            if (fy > 1.0) {
-                fy = 1.0;
-            }
-
-            b00 = mesh_bg_filtered[iy0 * nx + ix0];
-            b10 = mesh_bg_filtered[iy0 * nx + ix1];
-            b01 = mesh_bg_filtered[iy1 * nx + ix0];
-            b11 = mesh_bg_filtered[iy1 * nx + ix1];
-
-            bg = (1.0 - fx) * (1.0 - fy) * b00
-                + fx * (1.0 - fy) * b10
-                + (1.0 - fx) * fy * b01
-                + fx * fy * b11;
-
+            interpolate_mesh_value(g_mesh_bg_smooth, nx, ny, back_size, x, y, &bg);
             pixels[y * width + x] -= bg;
         }
     }
 
+    *out_nx = nx;
+    *out_ny = ny;
     return 0;
 }
 
-static int is_local_maximum(
-    const double* pixels,
-    long width,
-    long height,
-    long x,
-    long y,
-    int radius,
-    double threshold
-) {
-    long yy;
-    long xx;
-    const double center = pixels[y * width + x];
+static void apply_convolution(const sbss_config* cfg, const double* src, double* dst, long width, long height) {
+    long x;
+    long y;
 
-    if (center <= threshold) {
-        return 0;
-    }
-
-    for (yy = y - radius; yy <= y + radius; ++yy) {
-        for (xx = x - radius; xx <= x + radius; ++xx) {
-            if (xx < 0 || yy < 0 || xx >= width || yy >= height) {
-                continue;
-            }
-            if (xx == x && yy == y) {
-                continue;
-            }
-            if (pixels[yy * width + xx] >= center) {
-                return 0;
-            }
-        }
-    }
-
-    return 1;
-}
-
-static int estimate_area(
-    const double* pixels,
-    long width,
-    long height,
-    long x,
-    long y,
-    int radius,
-    double threshold
-) {
-    int area = 0;
-    long yy;
-    long xx;
-
-    for (yy = y - radius; yy <= y + radius; ++yy) {
-        for (xx = x - radius; xx <= x + radius; ++xx) {
-            if (xx < 0 || yy < 0 || xx >= width || yy >= height) {
-                continue;
-            }
-            if (pixels[yy * width + xx] > threshold) {
-                area++;
-            }
-        }
-    }
-
-    return area;
-}
-
-static void compute_centroid(
-    const double* pixels,
-    long width,
-    long height,
-    long x,
-    long y,
-    int radius,
-    double threshold,
-    double* cx,
-    double* cy,
-    double* flux
-) {
-    long yy;
-    long xx;
-    double weighted_x = 0.0;
-    double weighted_y = 0.0;
-    double weighted_sum = 0.0;
-
-    for (yy = y - radius; yy <= y + radius; ++yy) {
-        for (xx = x - radius; xx <= x + radius; ++xx) {
-            double value;
-            if (xx < 0 || yy < 0 || xx >= width || yy >= height) {
-                continue;
-            }
-
-            value = pixels[yy * width + xx] - threshold;
-            if (value <= 0.0) {
-                continue;
-            }
-
-            weighted_sum += value;
-            weighted_x += value * (double)xx;
-            weighted_y += value * (double)yy;
-        }
-    }
-
-    if (weighted_sum <= 0.0) {
-        *cx = (double)x;
-        *cy = (double)y;
-        *flux = pixels[y * width + x];
+    if (cfg->filter_enabled == 0 || cfg->filter_kernel_size <= 1) {
+        (void)memcpy(dst, src, (size_t)(width * height) * sizeof(double));
         return;
     }
 
-    *cx = weighted_x / weighted_sum;
-    *cy = weighted_y / weighted_sum;
-    *flux = weighted_sum;
+    {
+        int ks = cfg->filter_kernel_size;
+        int kr = ks / 2;
+        for (y = 0; y < height; ++y) {
+            for (x = 0; x < width; ++x) {
+                int ky;
+                int kx;
+                double sum = 0.0;
+
+                for (ky = -kr; ky <= kr; ++ky) {
+                    for (kx = -kr; kx <= kr; ++kx) {
+                        long sx = (long)clamp_int((int)x + kx, 0, (int)width - 1);
+                        long sy = (long)clamp_int((int)y + ky, 0, (int)height - 1);
+                        double w = cfg->filter_kernel[(ky + kr) * ks + (kx + kr)];
+                        sum += src[sy * width + sx] * w;
+                    }
+                }
+
+                dst[y * width + x] = sum;
+            }
+        }
+    }
+}
+
+static int threshold_exceeded(
+    int idx,
+    long width,
+    int nx,
+    int ny,
+    int back_size,
+    double detect_thresh_sigma,
+    const double* detect_pixels
+) {
+    long x = idx % (int)width;
+    long y = idx / (int)width;
+    double local_rms;
+
+    interpolate_mesh_value(g_mesh_rms_smooth, nx, ny, back_size, x, y, &local_rms);
+    if (local_rms < 1e-6) {
+        local_rms = 1e-6;
+    }
+
+    return detect_pixels[idx] > (detect_thresh_sigma * local_rms);
+}
+
+static void fill_detection(
+    sbss_detection* out,
+    const int* pixel_indices,
+    int n,
+    long width,
+    const double* residual,
+    const double* detect
+) {
+    int i;
+    int xmin = (int)width;
+    int xmax = 0;
+    int ymin = 2147483647;
+    int ymax = 0;
+    double wx = 0.0;
+    double wy = 0.0;
+    double wsum = 0.0;
+    double flux = 0.0;
+    double peak = -1e99;
+
+    for (i = 0; i < n; ++i) {
+        int idx = pixel_indices[i];
+        int x = idx % (int)width;
+        int y = idx / (int)width;
+        double rv = residual[idx];
+        double dv = detect[idx];
+        double w = (rv > 0.0) ? rv : 0.0;
+
+        if (x < xmin) {
+            xmin = x;
+        }
+        if (x > xmax) {
+            xmax = x;
+        }
+        if (y < ymin) {
+            ymin = y;
+        }
+        if (y > ymax) {
+            ymax = y;
+        }
+
+        flux += w;
+        wx += w * (double)x;
+        wy += w * (double)y;
+        wsum += w;
+        if (dv > peak) {
+            peak = dv;
+        }
+    }
+
+    out->x = (wsum > 1e-12) ? (wx / wsum) : (double)xmin;
+    out->y = (wsum > 1e-12) ? (wy / wsum) : (double)ymin;
+    out->xmin = xmin;
+    out->xmax = xmax;
+    out->ymin = ymin;
+    out->ymax = ymax;
+    out->peak = peak;
+    out->flux = flux;
+    out->area = n;
 }
 
 int sbss_detect_from_fits(
@@ -316,18 +371,14 @@ int sbss_detect_from_fits(
     char* error_message,
     size_t error_message_size
 ) {
-    static double pixel_workspace[SBSS_MAX_IMAGE_PIXELS];
     sbss_config local_cfg;
     long width = 0;
     long height = 0;
-    long x;
-    long y;
     long n_pix;
-    double mean = 0.0;
-    double sigma = 0.0;
-    double threshold = 0.0;
+    long idx;
+    int nx = 0;
+    int ny = 0;
     size_t out_count = 0;
-    int radius = 0;
 
     if (detections == NULL || detection_count == NULL || fits_path == NULL) {
         sbss_set_error(error_message, error_message_size, "invalid detection input");
@@ -340,47 +391,19 @@ int sbss_detect_from_fits(
         sbss_config_set_defaults(&local_cfg);
     }
 
-    if (local_cfg.filter_size < 1 || (local_cfg.filter_size % 2) == 0) {
-        sbss_set_error(error_message, error_message_size, "FILTER_SIZE must be an odd positive value");
+    if (local_cfg.detect_minarea < 1 || local_cfg.detect_thresh_sigma <= 0.0) {
+        sbss_set_error(error_message, error_message_size, "invalid detect parameters");
         return -1;
     }
 
-    if (local_cfg.back_size < SBSS_MIN_BACK_SIZE) {
-        sbss_set_error(error_message, error_message_size, "BACK_SIZE must be >= %d", SBSS_MIN_BACK_SIZE);
-        return -1;
-    }
-
-    if (local_cfg.back_filtersize < 1) {
-        sbss_set_error(error_message, error_message_size, "BACK_FILTERSIZE must be >= 1");
-        return -1;
-    }
-
-    if (local_cfg.detect_minarea < 1) {
-        sbss_set_error(error_message, error_message_size, "DETECT_MINAREA must be >= 1");
-        return -1;
-    }
-
-    if (local_cfg.max_sources < 1) {
-        sbss_set_error(error_message, error_message_size, "MAX_SOURCES must be >= 1");
-        return -1;
-    }
-
-    radius = local_cfg.filter_size / 2;
-
-    if ((size_t)local_cfg.max_sources > detections_capacity) {
-        sbss_set_error(
-            error_message,
-            error_message_size,
-            "MAX_SOURCES exceeds provided detection capacity (%d > %zu)",
-            local_cfg.max_sources,
-            detections_capacity
-        );
+    if (local_cfg.max_sources < 1 || (size_t)local_cfg.max_sources > detections_capacity) {
+        sbss_set_error(error_message, error_message_size, "invalid MAX_SOURCES vs capacity");
         return -1;
     }
 
     if (sbss_read_fits_image(
             fits_path,
-            pixel_workspace,
+            g_pixels,
             SBSS_MAX_IMAGE_PIXELS,
             &width,
             &height,
@@ -391,76 +414,94 @@ int sbss_detect_from_fits(
     }
 
     n_pix = width * height;
-    if (n_pix <= 0) {
-        sbss_set_error(error_message, error_message_size, "empty FITS image");
+    if (n_pix <= 0 || (size_t)n_pix > SBSS_MAX_IMAGE_PIXELS) {
+        sbss_set_error(error_message, error_message_size, "invalid image size");
         return -1;
     }
 
-    if (apply_background_subtraction(
-            pixel_workspace,
+    if (build_background_model(
+            g_pixels,
             width,
             height,
             local_cfg.back_size,
             local_cfg.back_filtersize,
+            &nx,
+            &ny,
             error_message,
             error_message_size
         ) != 0) {
         return -1;
     }
 
-    compute_stats(pixel_workspace, n_pix, &mean, &sigma);
-    threshold = mean + (local_cfg.detect_thresh_sigma * sigma);
+    apply_convolution(&local_cfg, g_pixels, g_detect_pixels, width, height);
 
+    (void)memset(g_visited, 0, (size_t)n_pix);
     (void)memset(detections, 0, detections_capacity * sizeof(sbss_detection));
 
-    for (y = 0; y < height; ++y) {
-        for (x = 0; x < width; ++x) {
-            int area;
-            double cx;
-            double cy;
-            double flux;
-            const double peak = pixel_workspace[y * width + x];
-
-            if (out_count >= (size_t)local_cfg.max_sources) {
-                break;
-            }
-
-            if (!is_local_maximum(pixel_workspace, width, height, x, y, radius, threshold)) {
-                continue;
-            }
-
-            area = estimate_area(pixel_workspace, width, height, x, y, radius, threshold);
-            if (area < local_cfg.detect_minarea) {
-                continue;
-            }
-
-            compute_centroid(
-                pixel_workspace,
-                width,
-                height,
-                x,
-                y,
-                radius,
-                threshold,
-                &cx,
-                &cy,
-                &flux
-            );
-
-            detections[out_count].x = cx;
-            detections[out_count].y = cy;
-            detections[out_count].xmin = (int)((x - radius) < 0 ? 0 : (x - radius));
-            detections[out_count].xmax = (int)((x + radius) >= width ? (width - 1) : (x + radius));
-            detections[out_count].ymin = (int)((y - radius) < 0 ? 0 : (y - radius));
-            detections[out_count].ymax = (int)((y + radius) >= height ? (height - 1) : (y + radius));
-            detections[out_count].peak = peak;
-            detections[out_count].flux = flux;
-            detections[out_count].area = area;
-            out_count++;
-        }
-
+    for (idx = 0; idx < n_pix; ++idx) {
         if (out_count >= (size_t)local_cfg.max_sources) {
             break;
+        }
+
+        if (g_visited[idx] != 0) {
+            continue;
+        }
+
+        if (threshold_exceeded((int)idx, width, nx, ny, local_cfg.back_size, local_cfg.detect_thresh_sigma, g_detect_pixels) == 0) {
+            continue;
+        }
+
+        {
+            int head = 0;
+            int tail = 0;
+            int i;
+
+            g_component_pixels[tail++] = (int)idx;
+            g_visited[idx] = 1;
+
+            while (head < tail) {
+                int cidx = g_component_pixels[head++];
+                int cx = cidx % (int)width;
+                int cy = cidx / (int)width;
+                int yy;
+                int xx;
+
+                for (yy = cy - 1; yy <= cy + 1; ++yy) {
+                    for (xx = cx - 1; xx <= cx + 1; ++xx) {
+                        int nidx;
+                        if (xx < 0 || yy < 0 || xx >= width || yy >= height) {
+                            continue;
+                        }
+                        nidx = yy * (int)width + xx;
+                        if (g_visited[nidx] != 0) {
+                            continue;
+                        }
+
+                        if (threshold_exceeded(nidx, width, nx, ny, local_cfg.back_size, local_cfg.detect_thresh_sigma, g_detect_pixels) != 0) {
+                            g_visited[nidx] = 1;
+                            if (tail < (int)SBSS_MAX_IMAGE_PIXELS) {
+                                g_component_pixels[tail++] = nidx;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (tail >= local_cfg.detect_minarea && out_count < detections_capacity) {
+                fill_detection(
+                    &detections[out_count],
+                    g_component_pixels,
+                    tail,
+                    width,
+                    g_pixels,
+                    g_detect_pixels
+                );
+                out_count++;
+            }
+
+            for (i = 0; i < tail; ++i) {
+                g_visited[g_component_pixels[i]] = 1;
+            }
         }
     }
 

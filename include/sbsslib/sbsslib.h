@@ -22,7 +22,12 @@ typedef struct sbss_detection {
 typedef struct sbss_config {
     double detect_thresh_sigma;
     int detect_minarea;
+    int deblend_nthresh;
+    double deblend_mincont;
+    int filter_enabled;
     int filter_size;
+    int filter_kernel_size;
+    double filter_kernel[49];
     int back_size;
     int back_filtersize;
     int max_sources;

@@ -17,8 +17,28 @@ int main(void) {
         return 1;
     }
 
+    if (cfg.deblend_nthresh < 1) {
+        fprintf(stderr, "default DEBLEND_NTHRESH should be >= 1\n");
+        return 1;
+    }
+
+    if (cfg.deblend_mincont < 0.0 || cfg.deblend_mincont > 1.0) {
+        fprintf(stderr, "default DEBLEND_MINCONT should be in [0,1]\n");
+        return 1;
+    }
+
+    if (cfg.filter_enabled == 0) {
+        fprintf(stderr, "default filter should be enabled\n");
+        return 1;
+    }
+
     if (cfg.filter_size < 1 || cfg.filter_size % 2 == 0) {
         fprintf(stderr, "default filter size should be odd and >= 1\n");
+        return 1;
+    }
+
+    if (cfg.filter_kernel_size < 1 || cfg.filter_kernel_size % 2 == 0) {
+        fprintf(stderr, "default filter kernel size should be odd and >= 1\n");
         return 1;
     }
 

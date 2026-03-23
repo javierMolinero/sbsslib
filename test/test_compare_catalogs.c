@@ -82,6 +82,10 @@ int main(int argc, char** argv) {
     double sum_abs_dx = 0.0;
     double sum_abs_dy = 0.0;
     double sum_rel_flux = 0.0;
+    double sum_abs_dxmin = 0.0;
+    double sum_abs_dxmax = 0.0;
+    double sum_abs_dymin = 0.0;
+    double sum_abs_dymax = 0.0;
     const double max_match_distance = 3.0;
 
     if (argc != 3) {
@@ -145,6 +149,10 @@ int main(int argc, char** argv) {
             sum_abs_dx += abs_dx;
             sum_abs_dy += abs_dy;
             sum_rel_flux += rel_flux;
+            sum_abs_dxmin += fabs((double)sbss_rows[i].xmin - (double)sx_rows[best_j].xmin);
+            sum_abs_dxmax += fabs((double)sbss_rows[i].xmax - (double)sx_rows[best_j].xmax);
+            sum_abs_dymin += fabs((double)sbss_rows[i].ymin - (double)sx_rows[best_j].ymin);
+            sum_abs_dymax += fabs((double)sbss_rows[i].ymax - (double)sx_rows[best_j].ymax);
         }
     }
 
@@ -157,9 +165,28 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    printf("Mean |dx|: %.4f px\n", sum_abs_dx / (double)match_count);
-    printf("Mean |dy|: %.4f px\n", sum_abs_dy / (double)match_count);
-    printf("Mean relative flux error: %.6f\n", sum_rel_flux / (double)match_count);
+    {
+        double mean_dx = sum_abs_dx / (double)match_count;
+        double mean_dy = sum_abs_dy / (double)match_count;
+        double mean_flux_rel = sum_rel_flux / (double)match_count;
+        double mean_dxmin = sum_abs_dxmin / (double)match_count;
+        double mean_dxmax = sum_abs_dxmax / (double)match_count;
+        double mean_dymin = sum_abs_dymin / (double)match_count;
+        double mean_dymax = sum_abs_dymax / (double)match_count;
+
+        printf("Mean |dx|: %.4f px\n", mean_dx);
+        printf("Mean |dy|: %.4f px\n", mean_dy);
+        printf("Mean relative flux error: %.6f\n", mean_flux_rel);
+        printf("Mean |dXMIN|: %.4f px\n", mean_dxmin);
+        printf("Mean |dXMAX|: %.4f px\n", mean_dxmax);
+        printf("Mean |dYMIN|: %.4f px\n", mean_dymin);
+        printf("Mean |dYMAX|: %.4f px\n", mean_dymax);
+
+        if (mean_dx > 0.5 || mean_dy > 0.5) {
+            fprintf(stderr, "centroid target failed: mean position error must be <= 0.5 px\n");
+            return 1;
+        }
+    }
 
     return 0;
 }

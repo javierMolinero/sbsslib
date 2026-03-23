@@ -156,9 +156,15 @@ int main(int argc, char** argv) {
         }
     }
 
-    printf("SBSS rows: %zu\n", sbss_n);
-    printf("SX rows:   %zu\n", sx_n);
-    printf("Matches (<= %.1f px): %zu\n", max_match_distance, match_count);
+    printf("\n");
+    printf("====================================\n");
+    printf("  SBSSLIB vs SEXTRACTOR COMPARISON\n");
+    printf("====================================\n");
+    printf("\n");
+    printf("Detection Summary:\n");
+    printf("  SBSS detections:  %zu\n", sbss_n);
+    printf("  SX detections:    %zu\n", sx_n);
+    printf("  Matched (<= %.1f px dist):  %zu\n", max_match_distance, match_count);
 
     if (match_count == 0) {
         fprintf(stderr, "no matched sources found; comparison is not meaningful\n");
@@ -168,22 +174,58 @@ int main(int argc, char** argv) {
     {
         double mean_dx = sum_abs_dx / (double)match_count;
         double mean_dy = sum_abs_dy / (double)match_count;
+        double mean_pos_error = (mean_dx + mean_dy) / 2.0;
         double mean_flux_rel = sum_rel_flux / (double)match_count;
         double mean_dxmin = sum_abs_dxmin / (double)match_count;
         double mean_dxmax = sum_abs_dxmax / (double)match_count;
         double mean_dymin = sum_abs_dymin / (double)match_count;
         double mean_dymax = sum_abs_dymax / (double)match_count;
 
-        printf("Mean |dx|: %.4f px\n", mean_dx);
-        printf("Mean |dy|: %.4f px\n", mean_dy);
-        printf("Mean relative flux error: %.6f\n", mean_flux_rel);
-        printf("Mean |dXMIN|: %.4f px\n", mean_dxmin);
-        printf("Mean |dXMAX|: %.4f px\n", mean_dxmax);
-        printf("Mean |dYMIN|: %.4f px\n", mean_dymin);
-        printf("Mean |dYMAX|: %.4f px\n", mean_dymax);
+        /* Calculate similarity percentages */
+        double detection_recall = (match_count / (double)sx_n) * 100.0;
+        double pos_tolerance = 0.5;  /* target <= 0.5 px */
+        double pos_accuracy = 100.0 * (1.0 - (mean_pos_error / pos_tolerance));
+        if (pos_accuracy < 0.0) pos_accuracy = 0.0;
+        if (pos_accuracy > 100.0) pos_accuracy = 100.0;
+
+        double flux_tolerance = 0.15;  /* target <= 15% error */
+        double flux_accuracy = 100.0 * (1.0 - (mean_flux_rel / flux_tolerance));
+        if (flux_accuracy < 0.0) flux_accuracy = 0.0;
+        if (flux_accuracy > 100.0) flux_accuracy = 100.0;
+
+        double bbox_error = (mean_dxmin + mean_dxmax + mean_dymin + mean_dymax) / 4.0;
+        double bbox_tolerance = 0.3;
+        double bbox_accuracy = 100.0 * (1.0 - (bbox_error / bbox_tolerance));
+        if (bbox_accuracy < 0.0) bbox_accuracy = 0.0;
+        if (bbox_accuracy > 100.0) bbox_accuracy = 100.0;
+
+        double overall_similarity = (detection_recall * 0.4 + pos_accuracy * 0.3 + 
+                                     flux_accuracy * 0.2 + bbox_accuracy * 0.1) / 100.0;
+
+        printf("\n");
+        printf("Detailed Metrics:\n");
+        printf("  Mean |dx|:                %.4f px\n", mean_dx);
+        printf("  Mean |dy|:                %.4f px\n", mean_dy);
+        printf("  Mean position error:      %.4f px\n", mean_pos_error);
+        printf("  Mean relative flux error: %.4f (%.2f%%)\n", mean_flux_rel, mean_flux_rel * 100.0);
+        printf("  Mean |dXMIN|:             %.4f px\n", mean_dxmin);
+        printf("  Mean |dXMAX|:             %.4f px\n", mean_dxmax);
+        printf("  Mean |dYMIN|:             %.4f px\n", mean_dymin);
+        printf("  Mean |dYMAX|:             %.4f px\n", mean_dymax);
+        printf("  Mean bbox error:          %.4f px\n", bbox_error);
+
+        printf("\n");
+        printf("Similarity Metrics:\n");
+        printf("  Detection Recall:         %.2f%% (%zu/%zu)\n", detection_recall, match_count, sx_n);
+        printf("  Position Accuracy:        %.2f%%\n", pos_accuracy);
+        printf("  Flux Accuracy:            %.2f%%\n", flux_accuracy);
+        printf("  Bbox Accuracy:            %.2f%%\n", bbox_accuracy);
+        printf("\n");
+        printf("  >>> OVERALL SIMILARITY:   %.2f%% <<<\n", overall_similarity * 100.0);
+        printf("\n");
 
         if (mean_dx > 0.5 || mean_dy > 0.5) {
-            fprintf(stderr, "centroid target failed: mean position error must be <= 0.5 px\n");
+            fprintf(stderr, "⚠ Warning: mean position error exceeds 0.5 px target\n");
             return 1;
         }
     }

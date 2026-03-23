@@ -1,0 +1,220 @@
+SBSSLIB - Quick Start Guide
+===========================
+
+SCENARIO 1: Detect Sources in a FITS Image (Simplest Use Case)
+==============================================================
+
+Command:
+  bin\sbssx.exe my_image.fits
+
+Output:
+  my_image.fit.sbss  (7-column detection catalog)
+
+Done! That's it. Uses default settings (Gaussian PSF, BACK_SIZE=64, etc.)
+
+
+SCENARIO 2: Detect with Custom Configuration
+==============================================
+
+Command:
+  bin\sbssx.exe my_image.fits -c my_config.sex -CATALOG_NAME my_output.sbss
+
+Components:
+  my_image.fits      - Your input FITS image
+  my_config.sex      - SExtractor config file with YOUR parameters
+  my_output.sbss     - Where to save the detection catalog
+
+Example .sex config file (my_config.sex):
+  BACK_SIZE           64
+  BACK_FILTERSIZE     3
+  DETECT_THRESH       1.5
+  DETECT_MINAREA      4
+  FILTER              Y
+  FILTER_NAME         default 1.conv
+
+Just copy config\centu2.sex and modify values as needed!
+
+
+SCENARIO 3: Compare Results vs SExtractor (Evaluation)
+======================================================
+
+Prerequisites:
+  - My image detection:           my_image.sbss
+  - SExtractor reference catalog: my_image.fit.sx
+
+Command:
+  bin\test_compare_catalogs.exe my_image.sbss my_image.fit.sx
+
+Output:
+  ====================================
+    SBSSLIB vs SEXTRACTOR COMPARISON
+  ====================================
+
+  Detection Summary:
+    SBSS detections:      3843
+    SX detections:        4021
+    Matched (<= 3.0 px):  3702
+
+  Similarity Metrics:
+    Detection Recall:     92.07% (3702/4021)
+    Position Accuracy:    88.47%
+    Flux Accuracy:        31.76%
+    Bbox Accuracy:        40.46%
+
+    >>> OVERALL SIMILARITY:   73.77% <<<
+
+Interpretation:
+  - Overall Similarity > 90%         ✓ Production ready
+  - Detection Recall > 85%           ✓ Finds most sources
+  - Position Accuracy > 80%          ✓ Centroids well aligned
+  - Flux Accuracy values vary        (depends on your tolerance)
+
+
+SCENARIO 4: Batch Process Multiple Images
+==========================================
+
+PowerShell Script (save as run_sbsslib.ps1):
+  foreach ($fits in Get-ChildItem *.fits) {
+    .\bin\sbssx.exe $fits.Name -c config\centu2.sex
+    Write-Host "Processed: $($fits.Name)"
+  }
+
+Then run:
+  .\run_sbsslib.ps1
+
+
+SCENARIO 5: Parameter Tuning (If Similarity < 80%)
+===================================================
+
+Problem: Detection Recall too low (missing sources)
+Solution:
+  Edit config file:
+    DETECT_THRESH    1.0    (was 1.5 - more sensitive)
+    DETECT_MINAREA   3      (was 4 - smaller sources detected)
+  Then re-run detection
+
+Problem: Position errors higher than expected
+Solution:
+  Edit config file:
+    BACK_SIZE        32     (was 64 - faster local adaptation)
+  Then re-run detection
+
+Problem: Flux estimates far from SExtractor
+Solution:
+  Check that FILTER Y is set and FILTER_NAME points to valid .conv file
+  Ensure kernel file contains proper PSF representation
+
+Problem: Bounding boxes don't match
+Solution:
+  This is less critical - usually acceptable as-is
+  Can adjust DETECT_MINAREA to change detection sizes
+
+
+COMMON COMMANDS
+===============
+
+Help (show usage):
+  bin\sbssx.exe
+
+List available configs:
+  type config\centu2.sex
+
+Run on all FITS files in current directory:
+  for %F in (*.fits) do bin\sbssx.exe %F -c config\centu2.sex
+
+Compare first result:
+  bin\test_compare_catalogs.exe *.sbss *.fit.sx
+
+View help:
+  type README.txt
+
+
+FILE FORMATS
+============
+
+Input:  FITS image (standard astronomical format)
+Output: 7-column ASCII catalog
+
+Column Order:
+  1. X_IMAGE              (1-indexed pixel X coordinate)
+  2. Y_IMAGE              (1-indexed pixel Y coordinate)
+  3. XMIN_IMAGE           (bounding box minimum X)
+  4. XMAX_IMAGE           (bounding box maximum X)
+  5. YMIN_IMAGE           (bounding box minimum Y)
+  6. YMAX_IMAGE           (bounding box maximum Y)
+  7. FLUX_AUTO            (integrated flux/brightness)
+
+Example row:
+  512.345  768.123  510  514  766  770  1234.56
+
+
+TROUBLESHOOTING
+===============
+
+Error: "cannot open FITS file"
+  - Check file exists and has .fits extension (or .fit)
+  - Ensure FITS file is not corrupted
+  - Try a different FITS file to rule out format issues
+
+Error: "cannot open config file"
+  - Check -c path points to valid .sex file
+  - Ensure file is readable
+  - Try with full path: -c C:\full\path\config.sex
+
+Error: "no matched sources found"
+  - Check if .sbss file is empty (no detections)
+  - Try lowering DETECT_THRESH in config
+  - Verify FITS image contains actual source data
+
+Error: "Comparison tool shows low similarity"
+  - Review parameter tuning section above
+  - Check if SExtractor reference catalog is appropriate
+  - Verify both catalogs are in correct format
+
+Overall Similarity < 80%? Follow tuning steps in SCENARIO 5
+
+
+TIP: Configuration File Best Practices
+======================================
+
+1. Start with config\centu2.sex (reference configuration)
+2. Make ONE parameter change at a time
+3. Document what you changed and the result
+4. Keep a "working_config.sex" once you find good settings
+5. Comment your modifications:
+   DETECT_THRESH  1.2  # lowered from 1.5 for crowded field
+
+Example working config for crowded field:
+  # Crowded field configuration
+  BACK_SIZE           32      # faster background adaptation
+  BACK_FILTERSIZE     3
+  DETECT_THRESH       0.8     # more sensitive
+  DETECT_MINAREA      2       # smaller detections allowed
+  FILTER              Y
+  FILTER_NAME         default 1.conv
+
+
+QUICKEST PATH TO RESULTS
+=========================
+
+1. Extract package
+2. Place your FITS file in same folder as bin\
+3. Open Command Prompt in this folder
+4. Run: bin\sbssx.exe my_image.fits
+5. Check my_image.fit.sbss created successfully
+6. If you have SExtractor reference:
+   bin\test_compare_catalogs.exe my_image.fit.sbss reference.fit.sx
+7. Review metrics!
+
+Total time: < 5 minutes
+
+
+NEXT STEPS
+==========
+
+✓ If similarity > 90%:   Ready for production! Start processing data.
+✓ If similarity 80-90%:  Good for most uses. Consider parameter tuning.
+✓ If similarity < 80%:   See tuning guide in doc\TEAM_DISTRIBUTION_GUIDE.md
+
+Questions? Full documentation: doc\USAGE_GUIDE.md
+Questions? Configuration details: Read config\centu2.sex comments

@@ -13,6 +13,8 @@ static double g_pixels[SBSS_MAX_IMAGE_PIXELS];
 static double g_detect_pixels[SBSS_MAX_IMAGE_PIXELS];
 static unsigned char g_visited[SBSS_MAX_IMAGE_PIXELS];
 static int g_component_pixels[SBSS_MAX_IMAGE_PIXELS];
+static int g_component_labels[SBSS_MAX_IMAGE_PIXELS];
+static int g_subcomponent_pixels[SBSS_MAX_IMAGE_PIXELS];
 static double g_mesh_bg[SBSS_MAX_MESH_COUNT];
 static double g_mesh_rms[SBSS_MAX_MESH_COUNT];
 static double g_mesh_bg_smooth[SBSS_MAX_MESH_COUNT];
@@ -26,6 +28,21 @@ static int compare_detection_peak_desc(const void* a, const void* b) {
         return 1;
     }
     if (da->peak > db->peak) {
+        return -1;
+    }
+    return 0;
+}
+
+static int compare_component_pixel_detect_desc(const void* a, const void* b) {
+    int ia = *(const int*)a;
+    int ib = *(const int*)b;
+    double va = g_detect_pixels[ia];
+    double vb = g_detect_pixels[ib];
+
+    if (va < vb) {
+        return 1;
+    }
+    if (va > vb) {
         return -1;
     }
     return 0;
@@ -556,6 +573,246 @@ static void fill_detection(
     out->area = n;
 }
 
+static size_t emit_component_with_deblend(
+    sbss_detection* detections,
+    size_t detections_capacity,
+    size_t out_count,
+    const sbss_config* cfg,
+    int component_size,
+    long width,
+    long height,
+    const double* residual,
+    const double* detect
+) {
+    int i;
+    int label_count = 0;
+    int keep_count = 0;
+    int max_labels;
+    int minarea;
+    double mincont;
+    double component_flux = 0.0;
+    static int keep_labels[SBSS_MAX_DETECTIONS];
+    static double label_flux[SBSS_MAX_DETECTIONS];
+    static int label_area[SBSS_MAX_DETECTIONS];
+    static double label_peak[SBSS_MAX_DETECTIONS];
+
+    if (component_size < cfg->detect_minarea) {
+        return 0;
+    }
+
+    /* Prepare maps for this component only. */
+    for (i = 0; i < component_size; ++i) {
+        int idx = g_component_pixels[i];
+        g_component_labels[idx] = -1; /* component member, not yet assigned */
+    }
+
+    qsort(g_component_pixels, (size_t)component_size, sizeof(int), compare_component_pixel_detect_desc);
+
+    minarea = (cfg->detect_minarea < 1) ? 1 : cfg->detect_minarea;
+    mincont = cfg->deblend_mincont;
+    if (mincont < 0.0) {
+        mincont = 0.0;
+    }
+    if (mincont > 1.0) {
+        mincont = 1.0;
+    }
+
+    max_labels = cfg->deblend_nthresh;
+    if (max_labels < 2) {
+        max_labels = 2;
+    }
+    if (max_labels > (int)SBSS_MAX_DETECTIONS - 1) {
+        max_labels = (int)SBSS_MAX_DETECTIONS - 1;
+    }
+
+    for (i = 0; i <= max_labels; ++i) {
+        label_flux[i] = 0.0;
+        label_area[i] = 0;
+        label_peak[i] = -1e99;
+    }
+
+    /* Watershed-like label growth in descending intensity order. */
+    for (i = 0; i < component_size; ++i) {
+        int idx = g_component_pixels[i];
+        int cx = idx % (int)width;
+        int cy = idx / (int)width;
+        int yy;
+        int xx;
+        int neighbor_labels[8];
+        int neighbor_count = 0;
+        int chosen_label = 0;
+        double best_peak = -1e99;
+        int is_local_peak = 1;
+
+        for (yy = cy - 1; yy <= cy + 1; ++yy) {
+            for (xx = cx - 1; xx <= cx + 1; ++xx) {
+                int nidx;
+                int nl;
+                int k;
+                int duplicate = 0;
+                if (xx == cx && yy == cy) {
+                    continue;
+                }
+                if (xx < 0 || yy < 0 || xx >= (int)width || yy >= (int)height) {
+                    continue;
+                }
+
+                nidx = yy * (int)width + xx;
+                nl = g_component_labels[nidx];
+
+                if (nl != 0 && detect[nidx] > detect[idx]) {
+                    is_local_peak = 0;
+                }
+
+                if (nl <= 0) {
+                    continue;
+                }
+
+                for (k = 0; k < neighbor_count; ++k) {
+                    if (neighbor_labels[k] == nl) {
+                        duplicate = 1;
+                        break;
+                    }
+                }
+                if (!duplicate && neighbor_count < 8) {
+                    neighbor_labels[neighbor_count++] = nl;
+                }
+            }
+        }
+
+        if (neighbor_count == 0) {
+            if (is_local_peak && label_count < max_labels) {
+                label_count++;
+                chosen_label = label_count;
+                label_peak[chosen_label] = detect[idx];
+            }
+        } else {
+            int k;
+            for (k = 0; k < neighbor_count; ++k) {
+                int nl = neighbor_labels[k];
+                if (label_peak[nl] > best_peak) {
+                    best_peak = label_peak[nl];
+                    chosen_label = nl;
+                }
+            }
+        }
+
+        if (chosen_label <= 0) {
+            g_component_labels[idx] = -2;
+        } else {
+            g_component_labels[idx] = chosen_label;
+            label_area[chosen_label] += 1;
+            if (residual[idx] > 0.0) {
+                label_flux[chosen_label] += residual[idx];
+            }
+        }
+
+        if (residual[idx] > 0.0) {
+            component_flux += residual[idx];
+        }
+    }
+
+    /* Attach unresolved saddle pixels to nearest labeled neighbors. */
+    for (i = 0; i < component_size; ++i) {
+        int idx = g_component_pixels[i];
+        int cx = idx % (int)width;
+        int cy = idx / (int)width;
+        int yy;
+        int xx;
+        int chosen_label = 0;
+        double best_peak = -1e99;
+
+        if (g_component_labels[idx] > 0) {
+            continue;
+        }
+
+        for (yy = cy - 1; yy <= cy + 1; ++yy) {
+            for (xx = cx - 1; xx <= cx + 1; ++xx) {
+                int nidx;
+                int nl;
+                if (xx == cx && yy == cy) {
+                    continue;
+                }
+                if (xx < 0 || yy < 0 || xx >= (int)width || yy >= (int)height) {
+                    continue;
+                }
+                nidx = yy * (int)width + xx;
+                nl = g_component_labels[nidx];
+                if (nl > 0 && label_peak[nl] > best_peak) {
+                    best_peak = label_peak[nl];
+                    chosen_label = nl;
+                }
+            }
+        }
+
+        if (chosen_label > 0) {
+            g_component_labels[idx] = chosen_label;
+            label_area[chosen_label] += 1;
+            if (residual[idx] > 0.0) {
+                label_flux[chosen_label] += residual[idx];
+            }
+        }
+    }
+
+    for (i = 1; i <= label_count; ++i) {
+        if (label_area[i] < minarea) {
+            continue;
+        }
+        if (component_flux > 1e-12 && label_flux[i] < (mincont * component_flux)) {
+            continue;
+        }
+        keep_labels[keep_count++] = i;
+    }
+
+    if (keep_count <= 1) {
+        if (out_count < detections_capacity) {
+            fill_detection(
+                &detections[out_count],
+                g_component_pixels,
+                component_size,
+                width,
+                height,
+                residual,
+                detect
+            );
+            out_count++;
+        }
+    } else {
+        int k;
+        for (k = 0; k < keep_count && out_count < detections_capacity; ++k) {
+            int label = keep_labels[k];
+            int nsub = 0;
+
+            for (i = 0; i < component_size; ++i) {
+                int idx = g_component_pixels[i];
+                if (g_component_labels[idx] == label) {
+                    g_subcomponent_pixels[nsub++] = idx;
+                }
+            }
+
+            if (nsub >= minarea) {
+                fill_detection(
+                    &detections[out_count],
+                    g_subcomponent_pixels,
+                    nsub,
+                    width,
+                    height,
+                    residual,
+                    detect
+                );
+                out_count++;
+            }
+        }
+    }
+
+    for (i = 0; i < component_size; ++i) {
+        int idx = g_component_pixels[i];
+        g_component_labels[idx] = 0;
+    }
+
+    return out_count;
+}
+
 int sbss_detect_from_fits(
     const char* fits_path,
     const sbss_config* cfg,
@@ -682,16 +939,17 @@ int sbss_detect_from_fits(
             }
 
             if (tail >= local_cfg.detect_minarea && out_count < detections_capacity) {
-                fill_detection(
-                    &detections[out_count],
-                    g_component_pixels,
+                out_count = emit_component_with_deblend(
+                    detections,
+                    detections_capacity,
+                    out_count,
+                    &local_cfg,
                     tail,
                     width,
                     height,
                     g_pixels,
                     g_detect_pixels
                 );
-                out_count++;
             }
 
             for (i = 0; i < tail; ++i) {

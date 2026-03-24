@@ -15,6 +15,7 @@ static unsigned char g_visited[SBSS_MAX_IMAGE_PIXELS];
 static int g_component_pixels[SBSS_MAX_IMAGE_PIXELS];
 static int g_component_labels[SBSS_MAX_IMAGE_PIXELS];
 static int g_subcomponent_pixels[SBSS_MAX_IMAGE_PIXELS];
+static int g_subcomponent_labels[SBSS_MAX_IMAGE_PIXELS];
 static double g_mesh_bg[SBSS_MAX_MESH_COUNT];
 static double g_mesh_rms[SBSS_MAX_MESH_COUNT];
 static double g_mesh_bg_smooth[SBSS_MAX_MESH_COUNT];
@@ -585,28 +586,47 @@ static size_t emit_component_with_deblend(
     const double* detect
 ) {
     int i;
-    int label_count = 0;
-    int keep_count = 0;
-    int max_labels;
     int minarea;
+    int nthresh;
+    int node_count = 0;
+    int terminal_count = 0;
+    int keep_count = 0;
     double mincont;
     double component_flux = 0.0;
-    static int keep_labels[SBSS_MAX_DETECTIONS];
-    static double label_flux[SBSS_MAX_DETECTIONS];
-    static int label_area[SBSS_MAX_DETECTIONS];
-    static double label_peak[SBSS_MAX_DETECTIONS];
+    double component_min_detect = 1e99;
+    double component_max_detect = -1e99;
+    static int level_region_area[SBSS_MAX_DETECTIONS];
+    static double level_region_flux[SBSS_MAX_DETECTIONS];
+    static double level_region_peak[SBSS_MAX_DETECTIONS];
+    static int level_region_node[SBSS_MAX_DETECTIONS];
+    static int node_parent[SBSS_MAX_DETECTIONS];
+    static int node_first_child[SBSS_MAX_DETECTIONS];
+    static int node_next_sibling[SBSS_MAX_DETECTIONS];
+    static int node_level[SBSS_MAX_DETECTIONS];
+    static double node_threshold[SBSS_MAX_DETECTIONS];
+    static int node_area[SBSS_MAX_DETECTIONS];
+    static double node_flux[SBSS_MAX_DETECTIONS];
+    static double node_peak[SBSS_MAX_DETECTIONS];
+    static int node_seed_idx[SBSS_MAX_DETECTIONS];
+    static int node_selected[SBSS_MAX_DETECTIONS];
+    static int node_leaf[SBSS_MAX_DETECTIONS];
+    static double node_saddle_flux[SBSS_MAX_DETECTIONS];
+    static double node_saddle_total[SBSS_MAX_DETECTIONS];
+    static int child_nodes[SBSS_MAX_DETECTIONS];
+    static double child_seed_x[SBSS_MAX_DETECTIONS];
+    static double child_seed_y[SBSS_MAX_DETECTIONS];
+    static int region_pixels[SBSS_MAX_DETECTIONS];
+    static int assign_queue[SBSS_MAX_DETECTIONS];
+    static int terminal_nodes[SBSS_MAX_DETECTIONS];
+    static double seed_peak[SBSS_MAX_DETECTIONS];
+    static double seed_cx[SBSS_MAX_DETECTIONS];
+    static double seed_cy[SBSS_MAX_DETECTIONS];
+    static int final_area[SBSS_MAX_DETECTIONS];
+    static double final_flux[SBSS_MAX_DETECTIONS];
 
     if (component_size < cfg->detect_minarea) {
-        return 0;
+        return out_count;
     }
-
-    /* Prepare maps for this component only. */
-    for (i = 0; i < component_size; ++i) {
-        int idx = g_component_pixels[i];
-        g_component_labels[idx] = -1; /* component member, not yet assigned */
-    }
-
-    qsort(g_component_pixels, (size_t)component_size, sizeof(int), compare_component_pixel_detect_desc);
 
     minarea = (cfg->detect_minarea < 1) ? 1 : cfg->detect_minarea;
     mincont = cfg->deblend_mincont;
@@ -617,112 +637,434 @@ static size_t emit_component_with_deblend(
         mincont = 1.0;
     }
 
-    max_labels = cfg->deblend_nthresh;
-    if (max_labels < 2) {
-        max_labels = 2;
+    nthresh = cfg->deblend_nthresh;
+    if (nthresh < 2) {
+        nthresh = 2;
     }
-    if (max_labels > (int)SBSS_MAX_DETECTIONS - 1) {
-        max_labels = (int)SBSS_MAX_DETECTIONS - 1;
-    }
-
-    for (i = 0; i <= max_labels; ++i) {
-        label_flux[i] = 0.0;
-        label_area[i] = 0;
-        label_peak[i] = -1e99;
+    if (nthresh > 64) {
+        nthresh = 64;
     }
 
-    /* Watershed-like label growth in descending intensity order. */
+    qsort(g_component_pixels, (size_t)component_size, sizeof(int), compare_component_pixel_detect_desc);
+
     for (i = 0; i < component_size; ++i) {
         int idx = g_component_pixels[i];
-        int cx = idx % (int)width;
-        int cy = idx / (int)width;
-        int yy;
-        int xx;
-        int neighbor_labels[8];
-        int neighbor_count = 0;
-        int chosen_label = 0;
-        double best_peak = -1e99;
-        int is_local_peak = 1;
+        double dv = detect[idx];
+        g_component_labels[idx] = 0;
+        g_subcomponent_labels[idx] = 0;
 
-        for (yy = cy - 1; yy <= cy + 1; ++yy) {
-            for (xx = cx - 1; xx <= cx + 1; ++xx) {
-                int nidx;
-                int nl;
-                int k;
-                int duplicate = 0;
-                if (xx == cx && yy == cy) {
-                    continue;
-                }
-                if (xx < 0 || yy < 0 || xx >= (int)width || yy >= (int)height) {
-                    continue;
-                }
-
-                nidx = yy * (int)width + xx;
-                nl = g_component_labels[nidx];
-
-                if (nl != 0 && detect[nidx] > detect[idx]) {
-                    is_local_peak = 0;
-                }
-
-                if (nl <= 0) {
-                    continue;
-                }
-
-                for (k = 0; k < neighbor_count; ++k) {
-                    if (neighbor_labels[k] == nl) {
-                        duplicate = 1;
-                        break;
-                    }
-                }
-                if (!duplicate && neighbor_count < 8) {
-                    neighbor_labels[neighbor_count++] = nl;
-                }
-            }
+        if (dv < component_min_detect) {
+            component_min_detect = dv;
         }
-
-        if (neighbor_count == 0) {
-            if (is_local_peak && label_count < max_labels) {
-                label_count++;
-                chosen_label = label_count;
-                label_peak[chosen_label] = detect[idx];
-            }
-        } else {
-            int k;
-            for (k = 0; k < neighbor_count; ++k) {
-                int nl = neighbor_labels[k];
-                if (label_peak[nl] > best_peak) {
-                    best_peak = label_peak[nl];
-                    chosen_label = nl;
-                }
-            }
+        if (dv > component_max_detect) {
+            component_max_detect = dv;
         }
-
-        if (chosen_label <= 0) {
-            g_component_labels[idx] = -2;
-        } else {
-            g_component_labels[idx] = chosen_label;
-            label_area[chosen_label] += 1;
-            if (residual[idx] > 0.0) {
-                label_flux[chosen_label] += residual[idx];
-            }
-        }
-
         if (residual[idx] > 0.0) {
             component_flux += residual[idx];
         }
     }
 
-    /* Attach unresolved saddle pixels to nearest labeled neighbors. */
+    /* Build explicit parent-child tree from threshold ladder (low -> high). */
+    if (component_max_detect > component_min_detect + 1e-9) {
+        int level_idx;
+        for (level_idx = 1; level_idx <= nthresh; ++level_idx) {
+            int region_count = 0;
+            double frac = ((double)level_idx) / (double)(nthresh + 1);
+            double level = component_min_detect + frac * (component_max_detect - component_min_detect);
+
+            for (i = 0; i < component_size; ++i) {
+                int idx = g_component_pixels[i];
+                g_component_labels[idx] = -1;
+            }
+
+            for (i = 0; i < component_size; ++i) {
+                int idx = g_component_pixels[i];
+                int head;
+                int tail;
+                int parent_candidate = 0;
+
+                if (detect[idx] < level || g_component_labels[idx] != -1) {
+                    continue;
+                }
+                if (region_count + 1 >= (int)SBSS_MAX_DETECTIONS) {
+                    break;
+                }
+
+                region_count++;
+                level_region_area[region_count] = 0;
+                level_region_flux[region_count] = 0.0;
+                level_region_peak[region_count] = -1e99;
+                level_region_node[region_count] = 0;
+
+                head = 0;
+                tail = 0;
+                g_subcomponent_pixels[tail++] = idx;
+                g_component_labels[idx] = region_count;
+
+                while (head < tail) {
+                    int cidx = g_subcomponent_pixels[head++];
+                    int cx = cidx % (int)width;
+                    int cy = cidx / (int)width;
+                    int yy;
+                    int xx;
+
+                    level_region_area[region_count] += 1;
+                    if (residual[cidx] > 0.0) {
+                        level_region_flux[region_count] += residual[cidx];
+                    }
+                    if (detect[cidx] > level_region_peak[region_count]) {
+                        level_region_peak[region_count] = detect[cidx];
+                    }
+                    if (g_subcomponent_labels[cidx] > 0) {
+                        parent_candidate = g_subcomponent_labels[cidx];
+                    }
+
+                    for (yy = cy - 1; yy <= cy + 1; ++yy) {
+                        for (xx = cx - 1; xx <= cx + 1; ++xx) {
+                            int nidx;
+                            if (xx < 0 || yy < 0 || xx >= (int)width || yy >= (int)height) {
+                                continue;
+                            }
+                            if (xx == cx && yy == cy) {
+                                continue;
+                            }
+
+                            nidx = yy * (int)width + xx;
+                            if (g_component_labels[nidx] != -1 || detect[nidx] < level) {
+                                continue;
+                            }
+
+                            g_component_labels[nidx] = region_count;
+                            if (tail < component_size) {
+                                g_subcomponent_pixels[tail++] = nidx;
+                            }
+                        }
+                    }
+                }
+
+                if (node_count + 1 >= (int)SBSS_MAX_DETECTIONS) {
+                    continue;
+                }
+
+                node_count++;
+                level_region_node[region_count] = node_count;
+                node_parent[node_count] = parent_candidate;
+                node_first_child[node_count] = 0;
+                node_next_sibling[node_count] = 0;
+                node_level[node_count] = level_idx;
+                node_threshold[node_count] = level;
+                node_area[node_count] = level_region_area[region_count];
+                node_flux[node_count] = level_region_flux[region_count];
+                node_peak[node_count] = level_region_peak[region_count];
+                node_selected[node_count] = 0;
+                node_leaf[node_count] = 1;
+                node_seed_idx[node_count] = idx;
+
+                if (parent_candidate > 0 && parent_candidate <= node_count) {
+                    int p = parent_candidate;
+                    node_leaf[p] = 0;
+                    node_next_sibling[node_count] = node_first_child[p];
+                    node_first_child[p] = node_count;
+                }
+            }
+
+            for (i = 0; i < component_size; ++i) {
+                int idx = g_component_pixels[i];
+                int rid = g_component_labels[idx];
+                if (rid > 0 && rid <= region_count) {
+                    g_subcomponent_labels[idx] = level_region_node[rid];
+                } else {
+                    g_subcomponent_labels[idx] = 0;
+                }
+            }
+        }
+    }
+
+    if (node_count < 2) {
+        if (out_count < detections_capacity) {
+            fill_detection(
+                &detections[out_count],
+                g_component_pixels,
+                component_size,
+                width,
+                height,
+                residual,
+                detect
+            );
+            out_count++;
+        }
+        for (i = 0; i < component_size; ++i) {
+            int idx = g_component_pixels[i];
+            g_component_labels[idx] = 0;
+            g_subcomponent_labels[idx] = 0;
+        }
+        return out_count;
+    }
+
+    /* Mark all current component pixels for fast membership checks. */
+    for (i = 1; i <= node_count; ++i) {
+        node_saddle_flux[i] = 0.0;
+        node_saddle_total[i] = 0.0;
+    }
+    for (i = 0; i < component_size; ++i) {
+        int idx = g_component_pixels[i];
+        g_component_labels[idx] = 1;
+        g_subcomponent_labels[idx] = 0;
+    }
+
+    /*
+     * True saddle-level accumulation per sibling set:
+     * for each node, distribute parent-region flux (at parent threshold) to its
+     * direct children by seeded growth, and cache per-child saddle flux.
+     */
+    for (i = 1; i <= node_count; ++i) {
+        int n = i;
+        int child = node_first_child[n];
+        int nchildren = 0;
+
+        while (child > 0 && nchildren < (int)SBSS_MAX_DETECTIONS - 1) {
+            if (node_area[child] >= minarea) {
+                child_nodes[nchildren] = child;
+                child_seed_x[nchildren] = (double)(node_seed_idx[child] % (int)width);
+                child_seed_y[nchildren] = (double)(node_seed_idx[child] / (int)width);
+                nchildren++;
+            }
+            child = node_next_sibling[child];
+        }
+
+        if (nchildren < 2) {
+            continue;
+        }
+
+        {
+            int h = 0;
+            int t = 0;
+            int region_count = 0;
+            int seed_head = 0;
+            int seed_tail = 0;
+            int parent_seed = node_seed_idx[n];
+            double saddle = node_threshold[n];
+            int s;
+
+            if (parent_seed < 0 || parent_seed >= (int)(width * height)) {
+                continue;
+            }
+
+            /* Build parent region at exact merge threshold. */
+            g_subcomponent_labels[parent_seed] = -1;
+            assign_queue[t++] = parent_seed;
+            while (h < t && region_count < component_size) {
+                int cidx = assign_queue[h++];
+                int cx = cidx % (int)width;
+                int cy = cidx / (int)width;
+                int yy;
+                int xx;
+
+                region_pixels[region_count++] = cidx;
+
+                for (yy = cy - 1; yy <= cy + 1; ++yy) {
+                    for (xx = cx - 1; xx <= cx + 1; ++xx) {
+                        int nidx;
+                        if (xx < 0 || yy < 0 || xx >= (int)width || yy >= (int)height) {
+                            continue;
+                        }
+                        if (xx == cx && yy == cy) {
+                            continue;
+                        }
+                        nidx = yy * (int)width + xx;
+                        if (g_component_labels[nidx] != 1) {
+                            continue;
+                        }
+                        if (g_subcomponent_labels[nidx] != 0) {
+                            continue;
+                        }
+                        if (detect[nidx] < saddle) {
+                            continue;
+                        }
+                        g_subcomponent_labels[nidx] = -1;
+                        assign_queue[t++] = nidx;
+                    }
+                }
+            }
+
+            for (s = 0; s < nchildren; ++s) {
+                int seed_idx = node_seed_idx[child_nodes[s]];
+                if (seed_idx >= 0 && seed_idx < (int)(width * height) && g_subcomponent_labels[seed_idx] == -1) {
+                    g_subcomponent_labels[seed_idx] = s + 1;
+                    assign_queue[seed_tail++] = seed_idx;
+                }
+            }
+
+            /* Multi-source growth inside parent region mask. */
+            while (seed_head < seed_tail) {
+                int cidx = assign_queue[seed_head++];
+                int cx = cidx % (int)width;
+                int cy = cidx / (int)width;
+                int lab = g_subcomponent_labels[cidx];
+                int yy;
+                int xx;
+
+                for (yy = cy - 1; yy <= cy + 1; ++yy) {
+                    for (xx = cx - 1; xx <= cx + 1; ++xx) {
+                        int nidx;
+                        if (xx < 0 || yy < 0 || xx >= (int)width || yy >= (int)height) {
+                            continue;
+                        }
+                        if (xx == cx && yy == cy) {
+                            continue;
+                        }
+                        nidx = yy * (int)width + xx;
+                        if (g_subcomponent_labels[nidx] != -1) {
+                            continue;
+                        }
+                        g_subcomponent_labels[nidx] = lab;
+                        assign_queue[seed_tail++] = nidx;
+                    }
+                }
+            }
+
+            /* Accumulate flux per child branch at this saddle threshold. */
+            for (s = 0; s < nchildren; ++s) {
+                node_saddle_flux[child_nodes[s]] = 0.0;
+            }
+            node_saddle_total[n] = 0.0;
+
+            for (s = 0; s < region_count; ++s) {
+                int pidx = region_pixels[s];
+                int lab = g_subcomponent_labels[pidx];
+                int use_lab = lab;
+                double f = (residual[pidx] > 0.0) ? residual[pidx] : 0.0;
+
+                if (use_lab <= 0) {
+                    int px = pidx % (int)width;
+                    int py = pidx / (int)width;
+                    int best = 1;
+                    double best_d2 = 1e99;
+                    int c;
+                    for (c = 0; c < nchildren; ++c) {
+                        double dx = (double)px - child_seed_x[c];
+                        double dy = (double)py - child_seed_y[c];
+                        double d2 = dx * dx + dy * dy;
+                        if (d2 < best_d2) {
+                            best_d2 = d2;
+                            best = c + 1;
+                        }
+                    }
+                    use_lab = best;
+                    g_subcomponent_labels[pidx] = use_lab;
+                }
+
+                if (use_lab > 0 && use_lab <= nchildren) {
+                    int child_node = child_nodes[use_lab - 1];
+                    node_saddle_flux[child_node] += f;
+                    node_saddle_total[n] += f;
+                }
+            }
+
+            /* Clear temporary region marks before next parent. */
+            for (s = 0; s < region_count; ++s) {
+                int pidx = region_pixels[s];
+                g_subcomponent_labels[pidx] = 0;
+            }
+        }
+    }
+
+    /* Tree split decision using cached saddle-level child fluxes. */
+    {
+        int n;
+        for (n = 1; n <= node_count; ++n) {
+            node_selected[n] = 0;
+        }
+
+        for (n = node_count; n >= 1; --n) {
+            int child = node_first_child[n];
+            int good_children = 0;
+            double saddle_total = node_saddle_total[n];
+
+            while (child > 0) {
+                if (node_area[child] >= minarea) {
+                    double child_flux = node_saddle_flux[child];
+                    if (saddle_total <= 1e-12 || child_flux >= (mincont * saddle_total)) {
+                        good_children++;
+                    }
+                }
+                child = node_next_sibling[child];
+            }
+
+            if (good_children >= 2) {
+                child = node_first_child[n];
+                while (child > 0) {
+                    if (node_area[child] >= minarea) {
+                        double child_flux = node_saddle_flux[child];
+                        if (saddle_total <= 1e-12 || child_flux >= (mincont * saddle_total)) {
+                            node_selected[child] = 1;
+                        }
+                    }
+                    child = node_next_sibling[child];
+                }
+            } else {
+                node_selected[n] = 1;
+            }
+        }
+    }
+
+    for (i = 1; i <= node_count; ++i) {
+        if (node_selected[i] && node_area[i] >= minarea) {
+            terminal_nodes[terminal_count++] = i;
+            if (terminal_count >= (int)SBSS_MAX_DETECTIONS - 1) {
+                break;
+            }
+        }
+    }
+
+    if (terminal_count <= 1) {
+        if (out_count < detections_capacity) {
+            fill_detection(
+                &detections[out_count],
+                g_component_pixels,
+                component_size,
+                width,
+                height,
+                residual,
+                detect
+            );
+            out_count++;
+        }
+        for (i = 0; i < component_size; ++i) {
+            int idx = g_component_pixels[i];
+            g_component_labels[idx] = 0;
+            g_subcomponent_labels[idx] = 0;
+        }
+        return out_count;
+    }
+
+    for (i = 0; i < component_size; ++i) {
+        int idx = g_component_pixels[i];
+        g_component_labels[idx] = 0;
+    }
+
+    for (i = 1; i <= terminal_count; ++i) {
+        int n = terminal_nodes[i - 1];
+        int seed_idx = node_seed_idx[n];
+        int sx = seed_idx % (int)width;
+        int sy = seed_idx / (int)width;
+        g_component_labels[seed_idx] = i;
+        seed_peak[i] = node_peak[n];
+        seed_cx[i] = (double)sx;
+        seed_cy[i] = (double)sy;
+        final_area[i] = 1;
+    }
+
     for (i = 0; i < component_size; ++i) {
         int idx = g_component_pixels[i];
         int cx = idx % (int)width;
         int cy = idx / (int)width;
         int yy;
         int xx;
-        int chosen_label = 0;
+        int chosen = g_component_labels[idx];
         double best_peak = -1e99;
 
-        if (g_component_labels[idx] > 0) {
+        if (chosen > 0) {
             continue;
         }
 
@@ -738,30 +1080,73 @@ static size_t emit_component_with_deblend(
                 }
                 nidx = yy * (int)width + xx;
                 nl = g_component_labels[nidx];
-                if (nl > 0 && label_peak[nl] > best_peak) {
-                    best_peak = label_peak[nl];
-                    chosen_label = nl;
+                if (nl > 0 && seed_peak[nl] > best_peak) {
+                    best_peak = seed_peak[nl];
+                    chosen = nl;
                 }
             }
         }
 
-        if (chosen_label > 0) {
-            g_component_labels[idx] = chosen_label;
-            label_area[chosen_label] += 1;
+        if (chosen > 0) {
+            g_component_labels[idx] = chosen;
+            final_area[chosen] += 1;
+            seed_cx[chosen] += (double)cx;
+            seed_cy[chosen] += (double)cy;
+        }
+    }
+
+    for (i = 1; i <= terminal_count; ++i) {
+        if (final_area[i] > 0) {
+            seed_cx[i] /= (double)final_area[i];
+            seed_cy[i] /= (double)final_area[i];
+        }
+    }
+
+    for (i = 0; i < component_size; ++i) {
+        int idx = g_component_pixels[i];
+        if (g_component_labels[idx] <= 0) {
+            int x = idx % (int)width;
+            int y = idx / (int)width;
+            int l;
+            int chosen = 1;
+            double best_d2 = 1e99;
+            for (l = 1; l <= terminal_count; ++l) {
+                double dx = (double)x - seed_cx[l];
+                double dy = (double)y - seed_cy[l];
+                double d2 = dx * dx + dy * dy;
+                if (d2 < best_d2) {
+                    best_d2 = d2;
+                    chosen = l;
+                }
+            }
+            g_component_labels[idx] = chosen;
+        }
+    }
+
+    for (i = 1; i <= terminal_count; ++i) {
+        final_area[i] = 0;
+        final_flux[i] = 0.0;
+    }
+    for (i = 0; i < component_size; ++i) {
+        int idx = g_component_pixels[i];
+        int lid = g_component_labels[idx];
+        if (lid > 0 && lid <= terminal_count) {
+            final_area[lid] += 1;
             if (residual[idx] > 0.0) {
-                label_flux[chosen_label] += residual[idx];
+                final_flux[lid] += residual[idx];
             }
         }
     }
 
-    for (i = 1; i <= label_count; ++i) {
-        if (label_area[i] < minarea) {
+    keep_count = 0;
+    for (i = 1; i <= terminal_count; ++i) {
+        if (final_area[i] < minarea) {
             continue;
         }
-        if (component_flux > 1e-12 && label_flux[i] < (mincont * component_flux)) {
+        if (component_flux > 1e-12 && final_flux[i] < (mincont * component_flux)) {
             continue;
         }
-        keep_labels[keep_count++] = i;
+        terminal_nodes[keep_count++] = i;
     }
 
     if (keep_count <= 1) {
@@ -780,8 +1165,8 @@ static size_t emit_component_with_deblend(
     } else {
         int k;
         for (k = 0; k < keep_count && out_count < detections_capacity; ++k) {
-            int label = keep_labels[k];
             int nsub = 0;
+            int label = terminal_nodes[k];
 
             for (i = 0; i < component_size; ++i) {
                 int idx = g_component_pixels[i];
@@ -808,6 +1193,7 @@ static size_t emit_component_with_deblend(
     for (i = 0; i < component_size; ++i) {
         int idx = g_component_pixels[i];
         g_component_labels[idx] = 0;
+        g_subcomponent_labels[idx] = 0;
     }
 
     return out_count;

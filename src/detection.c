@@ -302,11 +302,174 @@ static int threshold_exceeded(
     return detect_pixels[idx] > (detect_thresh_sigma * local_rms);
 }
 
+/* -----------------------------------------------------------------------
+ * Elliptical aperture photometry helpers.
+ * Mirrors SExtractor FLUX_AUTO: moments → ellipse → elliptical Kron radius
+ * → elliptical aperture integration.
+ * ----------------------------------------------------------------------- */
+
+static void compute_second_order_moments(
+    const int* pixel_indices,
+    int n,
+    long width,
+    const double* residual,
+    double center_x,
+    double center_y,
+    double* mxx,
+    double* myy,
+    double* mxy
+) {
+    int i;
+    double sum_mxx = 0.0;
+    double sum_myy = 0.0;
+    double sum_mxy = 0.0;
+    double sum_w   = 0.0;
+
+    for (i = 0; i < n; ++i) {
+        int idx = pixel_indices[i];
+        int x   = idx % (int)width;
+        int y   = idx / (int)width;
+        double dx = (double)x - center_x;
+        double dy = (double)y - center_y;
+        double w  = residual[idx];
+        if (w < 0.0) { w = 0.0; }
+        sum_mxx += w * dx * dx;
+        sum_myy += w * dy * dy;
+        sum_mxy += w * dx * dy;
+        sum_w   += w;
+    }
+
+    if (sum_w > 1e-12) {
+        *mxx = sum_mxx / sum_w;
+        *myy = sum_myy / sum_w;
+        *mxy = sum_mxy / sum_w;
+    } else {
+        *mxx = 1.0;
+        *myy = 1.0;
+        *mxy = 0.0;
+    }
+}
+
+/* Decompose moments into semi-axes A >= B and inverse-covariance coefficients
+ * CXX, CYY, CXY  such that  CXX*dx^2 + CYY*dy^2 + CXY*dx*dy <= r^2  defines
+ * an ellipse of "elliptical radius" r centred at the source centroid. */
+static void moments_to_ellipse(
+    double mxx,
+    double myy,
+    double mxy,
+    double* a_out,
+    double* b_out,
+    double* cxx_out,
+    double* cyy_out,
+    double* cxy_out
+) {
+    double tmp = sqrt(((mxx - myy) * (mxx - myy)) / 4.0 + mxy * mxy);
+    double a2  = (mxx + myy) / 2.0 + tmp;
+    double b2  = (mxx + myy) / 2.0 - tmp;
+    double a, b, theta, cos_t, sin_t;
+
+    if (a2 < 0.0625) { a2 = 0.0625; }  /* floor at 0.25 px semi-axis */
+    if (b2 < 0.0625) { b2 = 0.0625; }
+    if (b2 > a2)     { b2 = a2; }
+
+    a     = sqrt(a2);
+    b     = sqrt(b2);
+    theta = 0.5 * atan2(2.0 * mxy, mxx - myy);
+    cos_t = cos(theta);
+    sin_t = sin(theta);
+
+    *cxx_out = (cos_t * cos_t) / a2 + (sin_t * sin_t) / b2;
+    *cyy_out = (sin_t * sin_t) / a2 + (cos_t * cos_t) / b2;
+    *cxy_out = 2.0 * cos_t * sin_t * (1.0 / a2 - 1.0 / b2);
+    *a_out   = a;
+    *b_out   = b;
+}
+
+/* Elliptical Kron radius: R_k = Sum(w * r_ellip) / Sum(w)          */
+static double estimate_elliptical_kron_radius(
+    const int* pixel_indices,
+    int n,
+    long width,
+    const double* residual,
+    double center_x,
+    double center_y,
+    double cxx,
+    double cyy,
+    double cxy
+) {
+    int i;
+    double sum_rw = 0.0;
+    double sum_w  = 0.0;
+    double kron_radius;
+
+    if (n < 2) { return 1.5; }
+
+    for (i = 0; i < n; ++i) {
+        int idx   = pixel_indices[i];
+        int x     = idx % (int)width;
+        int y     = idx / (int)width;
+        double dx = (double)x - center_x;
+        double dy = (double)y - center_y;
+        double q  = cxx * dx * dx + cyy * dy * dy + cxy * dx * dy;
+        double r  = (q > 0.0) ? sqrt(q) : 0.0;
+        double w  = residual[idx];
+        if (w < 0.0) { w = 0.0; }
+        sum_rw += w * r;
+        sum_w  += w;
+    }
+
+    kron_radius = (sum_w > 1e-12) ? (sum_rw / sum_w) : 1.5;
+    if (kron_radius < 1.0) { kron_radius = 1.0; }
+    if (kron_radius > 8.0) { kron_radius = 8.0; }
+    return kron_radius;
+}
+
+/* Integrate flux within ellipse  CXX*dx^2 + CYY*dy^2 + CXY*dx*dy <= ap^2.
+ * Bounding box is aperture_radius * a_semi + 2 pixels each side.          */
+static double calculate_elliptical_aperture_flux(
+    const double* image,
+    long width,
+    long height,
+    double center_x,
+    double center_y,
+    double aperture_radius,
+    double cxx,
+    double cyy,
+    double cxy,
+    double a_semi
+) {
+    double r2_limit = aperture_radius * aperture_radius;
+    int    bbox     = (int)ceil(aperture_radius * a_semi) + 2;
+    int    dx, dy;
+    double flux = 0.0;
+
+    if (bbox > 60) { bbox = 60; }
+
+    for (dy = -bbox; dy <= bbox; ++dy) {
+        for (dx = -bbox; dx <= bbox; ++dx) {
+            long   px  = (long)((int)center_x + dx);
+            long   py  = (long)((int)center_y + dy);
+            double fdx = (double)dx;
+            double fdy = (double)dy;
+            double q;
+
+            if (px < 0 || px >= width || py < 0 || py >= height) { continue; }
+
+            q = cxx * fdx * fdx + cyy * fdy * fdy + cxy * fdx * fdy;
+            if (q > r2_limit) { continue; }
+
+            flux += image[py * width + px];
+        }
+    }
+    return flux;
+}
+
 static void fill_detection(
     sbss_detection* out,
     const int* pixel_indices,
     int n,
     long width,
+    long height,
     const double* residual,
     const double* detect
 ) {
@@ -319,40 +482,71 @@ static void fill_detection(
     double wy = 0.0;
     double wsum = 0.0;
     double flux = 0.0;
+    double morph_flux;
+    double aperture_flux;
     double peak = -1e99;
+    double center_x;
+    double center_y;
+    double mxx, myy, mxy;
+    double a_ax, b_ax;
+    double cxx, cyy, cxy;
+    double kron_radius;
+    double ap;
 
+    /* Step 1: basic stats — centroid, bbox, peak, morphological flux */
     for (i = 0; i < n; ++i) {
         int idx = pixel_indices[i];
-        int x = idx % (int)width;
-        int y = idx / (int)width;
+        int x   = idx % (int)width;
+        int y   = idx / (int)width;
         double rv = residual[idx];
         double dv = detect[idx];
-        double w = (rv > 0.0) ? rv : 0.0;
+        double w  = (rv > 0.0) ? rv : 0.0;
 
-        if (x < xmin) {
-            xmin = x;
-        }
-        if (x > xmax) {
-            xmax = x;
-        }
-        if (y < ymin) {
-            ymin = y;
-        }
-        if (y > ymax) {
-            ymax = y;
-        }
+        if (x < xmin) { xmin = x; }
+        if (x > xmax) { xmax = x; }
+        if (y < ymin) { ymin = y; }
+        if (y > ymax) { ymax = y; }
 
-        flux += w;
-        wx += w * (double)x;
-        wy += w * (double)y;
-        wsum += w;
-        if (dv > peak) {
-            peak = dv;
-        }
+        flux  += w;
+        wx    += w * (double)x;
+        wy    += w * (double)y;
+        wsum  += w;
+        if (dv > peak) { peak = dv; }
     }
 
-    out->x = (wsum > 1e-12) ? (wx / wsum) : (double)xmin;
-    out->y = (wsum > 1e-12) ? (wy / wsum) : (double)ymin;
+    /* Step 2: centroid */
+    center_x = (wsum > 1e-12) ? (wx / wsum) : (double)xmin;
+    center_y = (wsum > 1e-12) ? (wy / wsum) : (double)ymin;
+
+    /* Step 3: second-order moments → ellipse axes and inverse-covariance */
+    compute_second_order_moments(
+        pixel_indices, n, width, residual, center_x, center_y,
+        &mxx, &myy, &mxy
+    );
+    moments_to_ellipse(mxx, myy, mxy, &a_ax, &b_ax, &cxx, &cyy, &cxy);
+
+    /* Step 4: elliptical Kron radius → aperture in elliptical-radius units */
+    kron_radius = estimate_elliptical_kron_radius(
+        pixel_indices, n, width, residual, center_x, center_y, cxx, cyy, cxy
+    );
+    ap = 2.5 * kron_radius;
+    if (ap < 3.5 / a_ax) { ap = 3.5 / a_ax; }  /* enforce min ~3.5 px radius */
+
+    /* Step 5: elliptical aperture flux */
+    aperture_flux = calculate_elliptical_aperture_flux(
+        residual, width, height, center_x, center_y, ap, cxx, cyy, cxy, a_ax
+    );
+
+    morph_flux = flux;
+
+    /* Use aperture flux; cap to 1.55x morphological to suppress blend runaway */
+    if (aperture_flux > 0.0) {
+        double cap = (morph_flux > 0.0) ? (1.55 * morph_flux) : aperture_flux;
+        flux = (aperture_flux > cap) ? cap : aperture_flux;
+    }
+
+    out->x    = center_x;
+    out->y    = center_y;
     out->xmin = xmin;
     out->xmax = xmax;
     out->ymin = ymin;
@@ -493,6 +687,7 @@ int sbss_detect_from_fits(
                     g_component_pixels,
                     tail,
                     width,
+                    height,
                     g_pixels,
                     g_detect_pixels
                 );

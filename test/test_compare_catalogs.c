@@ -86,7 +86,7 @@ int main(int argc, char** argv) {
     double sum_abs_dxmax = 0.0;
     double sum_abs_dymin = 0.0;
     double sum_abs_dymax = 0.0;
-    const double max_match_distance = 3.0;
+    const double max_match_distance = 0.5;
 
     if (argc != 3) {
         fprintf(stderr, "usage: test_compare_catalogs <sbss_catalog> <sx_catalog>\n");
